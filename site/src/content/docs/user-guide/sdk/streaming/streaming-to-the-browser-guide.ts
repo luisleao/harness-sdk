@@ -1,22 +1,24 @@
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@strands-agents/sdk'
-import type { AgentResult, AgentStreamEvent } from '@strands-agents/sdk'
+import type { AgentResult, AgentStreamEvent, ModelStreamEvent } from '@strands-agents/sdk'
 import express, { type Request } from 'express'
 
 // --8<-- [start:public_event_schema]
 /** Public event schema, version 1. Your app owns this contract, not the SDK. */
 export type PublicEvent =
   | { v: 1; type: 'text'; text: string }
+  | { v: 1; type: 'redact'; text: string }
   | {
       v: 1
       type: 'tool'
+      callId: number
       name: string
       status: 'started' | 'succeeded' | 'failed'
     }
   | {
       v: 1
       type: 'final'
-      status: 'complete' | 'cancelled' | 'error'
+      status: 'complete' | 'incomplete' | 'blocked' | 'cancelled' | 'error'
       stopReason?: string
       text: string
     }
@@ -26,28 +28,60 @@ export type PublicEnvelope = PublicEvent & { id: number }
 // --8<-- [end:public_event_schema]
 
 // --8<-- [start:event_mapper]
+/** Turns one Strands event into a public event, or drops it. */
+export type EventMapper = (event: AgentStreamEvent) => PublicEvent | undefined
+
 /**
  * Allowlist mapping. Every Strands event that is not listed here is dropped,
  * which covers reasoning, tool input, tool results, and lifecycle events.
+ * Create one mapper per run: it numbers the run's tool calls.
  */
-export function toPublicEvent(event: AgentStreamEvent): PublicEvent | undefined {
-  switch (event.type) {
-    case 'modelStreamUpdateEvent': {
-      const inner = event.event
-      if (inner.type !== 'modelContentBlockDeltaEvent') return undefined
-      if (inner.delta.type !== 'textDelta') return undefined
-      return { v: 1, type: 'text', text: inner.delta.text }
+export function createEventMapper(): EventMapper {
+  // Tools run concurrently, and a retried call repeats its toolUseId,
+  // so each call gets a number of its own while it runs.
+  const runningCalls = new Map<string, number>()
+  let lastCallId = 0
+
+  return (event) => {
+    switch (event.type) {
+      case 'modelStreamUpdateEvent':
+        return fromModelEvent(event.event)
+      case 'beforeToolCallEvent': {
+        const callId = ++lastCallId
+        runningCalls.set(event.toolUse.toolUseId, callId)
+        return { v: 1, type: 'tool', callId, name: event.toolUse.name, status: 'started' }
+      }
+      case 'afterToolCallEvent': {
+        const callId = runningCalls.get(event.toolUse.toolUseId) ?? ++lastCallId
+        runningCalls.delete(event.toolUse.toolUseId)
+        const status = event.result.status === 'success' ? 'succeeded' : 'failed'
+        return { v: 1, type: 'tool', callId, name: event.toolUse.name, status }
+      }
+      default:
+        return undefined
     }
-    case 'beforeToolCallEvent':
-      return { v: 1, type: 'tool', name: event.toolUse.name, status: 'started' }
-    case 'afterToolCallEvent': {
-      const status = event.result.status === 'success' ? 'succeeded' : 'failed'
-      return { v: 1, type: 'tool', name: event.toolUse.name, status }
-    }
-    default:
-      return undefined
   }
 }
+
+function fromModelEvent(event: ModelStreamEvent): PublicEvent | undefined {
+  // A guardrail blocked the output: send the replacement, never the original.
+  if (event.type === 'modelRedactionEvent') {
+    const replacement = event.outputRedaction?.replaceContent
+    if (replacement === undefined) return undefined
+    return { v: 1, type: 'redact', text: replacement }
+  }
+  if (event.type !== 'modelContentBlockDeltaEvent') return undefined
+  const { delta } = event
+  if (delta.type === 'textDelta') return { v: 1, type: 'text', text: delta.text }
+  // A cited answer arrives as citation deltas: keep the generated text, drop the sources.
+  if (delta.type !== 'citationsDelta') return undefined
+  const text = delta.content.map((content) => content.text).join('')
+  return text ? { v: 1, type: 'text', text } : undefined
+}
+
+// The answer is done after these stop reasons, and blocked after these.
+const COMPLETE_REASONS = new Set(['endTurn', 'stopSequence'])
+const BLOCKED_REASONS = new Set(['guardrailIntervened', 'contentFiltered', 'refusal'])
 
 /** The one authoritative final event, built from the agent result. */
 export function toFinalEvent(result: AgentResult): PublicEvent {
@@ -55,11 +89,22 @@ export function toFinalEvent(result: AgentResult): PublicEvent {
   if (stopReason === 'cancelled') {
     return { v: 1, type: 'final', status: 'cancelled', stopReason, text: '' }
   }
-  // Read text blocks only: toString() and toJSON() also include reasoning.
+  // Read text and cited text only: toString() and toJSON() also include reasoning.
   const text = lastMessage.content
-    .flatMap((block) => (block.type === 'textBlock' ? [block.text] : []))
+    .flatMap((block) => {
+      if (block.type === 'textBlock') return [block.text]
+      if (block.type === 'citationsBlock') return block.content.map((part) => part.text)
+      return []
+    })
     .join('')
-  return { v: 1, type: 'final', status: 'complete', stopReason, text }
+  return { v: 1, type: 'final', status: finalStatus(stopReason), stopReason, text }
+}
+
+/** Limits, interrupts, and checkpoints stop a run before its answer is done. */
+function finalStatus(stopReason: string): 'complete' | 'incomplete' | 'blocked' {
+  if (COMPLETE_REASONS.has(stopReason)) return 'complete'
+  if (BLOCKED_REASONS.has(stopReason)) return 'blocked'
+  return 'incomplete'
 }
 
 /** Sent when the run throws. The error itself stays in the server log. */
@@ -150,6 +195,7 @@ export function startRun(prompt: string): AgentRun {
 }
 
 async function execute(run: AgentRun, agent: Agent, prompt: string): Promise<void> {
+  const toPublicEvent = createEventMapper()
   let final = errorFinalEvent
   try {
     for await (const event of agent.stream(prompt, { cancelSignal: run.signal })) {
@@ -190,6 +236,9 @@ function expressServer() {
     return Number.isInteger(id) && id > 0 ? id : 0
   }
 
+  // How far a client may fall behind before the server drops it.
+  const MAX_PENDING_BYTES = 256 * 1024
+
   app.get('/runs/:id/events', (req, res) => {
     const run = getRun(req.params.id)
     if (!run) {
@@ -211,10 +260,17 @@ function expressServer() {
     res.flushHeaders()
     res.write('retry: 3000\n\n')
 
-    const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000)
+    const open = () => !res.writableEnded && !res.destroyed
+    const heartbeat = setInterval(() => {
+      if (open()) res.write(': ping\n\n')
+    }, 15_000)
     const unsubscribe = run.subscribe(after, (event) => {
+      if (!open()) return
       res.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`)
       if (event.type === 'final') res.end()
+      // Drop a client that stopped reading, so unsent events can't pile up.
+      // EventSource reconnects with Last-Event-ID, and the buffer replays the rest.
+      else if (res.writableLength > MAX_PENDING_BYTES) res.destroy()
     })
     // A dropped connection only unsubscribes. The run keeps going for a reconnect.
     res.on('close', () => {
@@ -234,9 +290,12 @@ function expressServer() {
       return
     }
     const events: PublicEnvelope[] = []
-    const respond = () => {
+    const stopWaiting = () => {
       clearTimeout(timeout)
       unsubscribe()
+    }
+    const respond = () => {
+      stopWaiting()
       if (!res.headersSent) res.json({ events })
     }
     // Answer after the replayed batch or the first live event, or after 25 seconds.
@@ -244,7 +303,8 @@ function expressServer() {
       if (events.push(event) === 1) queueMicrotask(respond)
     })
     const timeout = setTimeout(respond, 25_000)
-    res.on('close', respond)
+    // The client went away: stop waiting, and write nothing to the closed connection.
+    res.on('close', stopWaiting)
   })
   // --8<-- [end:express_long_poll]
 }
@@ -260,6 +320,8 @@ function browserClient() {
     const { id } = (await response.json()) as { id: string }
 
     let text = ''
+    // Tools run concurrently, so track each running call by its callId.
+    const runningTools = new Map<number, string>()
     const source = new EventSource(`/runs/${id}/events`)
     source.onmessage = (message) => {
       const event = JSON.parse(message.data) as PublicEnvelope
@@ -270,9 +332,18 @@ function browserClient() {
           text += event.text
           answer.textContent = text
           break
-        case 'tool':
-          status.textContent = event.status === 'started' ? `Running ${event.name}` : ''
+        case 'redact':
+          // A guardrail blocked the answer: replace everything shown so far.
+          text = event.text
+          answer.textContent = text
           break
+        case 'tool': {
+          if (event.status === 'started') runningTools.set(event.callId, event.name)
+          else runningTools.delete(event.callId)
+          const names = [...runningTools.values()].join(', ')
+          status.textContent = names ? `Running ${names}` : ''
+          break
+        }
         case 'final':
           source.close()
           // The final event is authoritative: it replaces the streamed text.

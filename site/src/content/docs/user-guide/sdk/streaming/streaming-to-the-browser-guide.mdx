@@ -6,6 +6,7 @@ description: >-
 sidebar:
   label: "Stream to the browser"
 tags: [streaming]
+languages: TypeScript
 addedDate: 2026-10-23
 sourceLinks:
   - path: strands-ts/src/hooks/events.ts
@@ -24,7 +25,8 @@ This guide builds that stream with [server-sent events (SSE)][mdn-sse], from Exp
 the Next.js App Router. Each prompt starts a run, one agent invocation that the server
 tracks by ID. You define a public event schema that never carries reasoning or tool input.
 Every event in a run gets an ID the browser can resume from. Every run ends with one
-authoritative final message.
+authoritative final message. The examples are TypeScript, but the pattern carries over to
+a Python server: a public schema, an allowlist, event IDs, and one final event.
 
 Writing the agent's events straight into the HTTP response breaks in two ways. A dropped
 connection loses the rest of the answer, and the browser receives every Strands event,
@@ -67,7 +69,7 @@ the browser allows.
 | Transport | Use it when | Trade-off |
 |-----------|-------------|-----------|
 | SSE | The browser only listens | Data flows one way |
-| WebSocket | The browser sends messages during a run | You write the resume logic |
+| WebSocket | The browser sends messages during a run | You write the reconnect logic |
 | Long polling | A proxy buffers streaming responses | More requests, more latency |
 
 Start with SSE. It runs over plain HTTP, works in Next.js route handlers, and the
@@ -88,7 +90,7 @@ and tool call events carry the tool input. The agent result includes the full la
 message, reasoning blocks included. `AgentResult.toString()` includes reasoning text too.
 :::
 
-This schema has three event types:
+This schema has four event types:
 
 ```typescript
 --8<-- "user-guide/sdk/streaming/streaming-to-the-browser-guide.ts:public_event_schema"
@@ -97,9 +99,23 @@ This schema has three event types:
 Each type has one job:
 
 - `text` carries a piece of the model response.
-- `tool` reports a tool by name and status. It never carries the tool's input or result.
+- `redact` replaces everything the browser shows, after a guardrail blocks the response.
+- `tool` reports one tool call by number, name, and status. It never carries the tool's
+  input or result. `callId` tells concurrent calls apart, even calls to the same tool.
 - `final` closes every run exactly once, with the status, the stop reason, and the full
   answer. The browser replaces the streamed text with it.
+
+The final status says how the run ended:
+
+- `complete`: the model finished its answer.
+- `incomplete`: an [invocation limit](../agents/agent-loop.md#invocation-limits), an
+  interrupt, or a checkpoint stopped the run early.
+- `blocked`: a guardrail blocked the response, or the model refused.
+- `cancelled` or `error`: the run was cancelled, or it failed. A model that reaches its
+  output token limit makes the SDK throw, so that run ends with `error`.
+
+`stopReason` carries the exact Strands stop reason, such as `limitTurns` or
+`guardrailIntervened`.
 
 Every event has `v: 1` and an `id` that counts up from 1 within the run. Clients ignore
 event types and fields they don't recognize, so adding a field keeps the schema at
@@ -115,10 +131,10 @@ data: {"id":1,"v":1,"type":"text","text":"Let "}
 ...
 
 id: 8
-data: {"id":8,"v":1,"type":"tool","name":"get_weather","status":"started"}
+data: {"id":8,"v":1,"type":"tool","callId":1,"name":"get_weather","status":"started"}
 
 id: 9
-data: {"id":9,"v":1,"type":"tool","name":"get_weather","status":"succeeded"}
+data: {"id":9,"v":1,"type":"tool","callId":1,"name":"get_weather","status":"succeeded"}
 
 ...
 
@@ -145,16 +161,30 @@ and the mapping in one module, `public-events.ts`:
 | Strands event | Public event |
 |---------------|--------------|
 | `modelStreamUpdateEvent` with a `textDelta` | `text` |
-| `modelStreamUpdateEvent` with any other delta | dropped |
+| `modelStreamUpdateEvent` with a `citationsDelta` | `text`, without the sources |
+| `modelStreamUpdateEvent` with an output `modelRedactionEvent` | `redact` |
+| `modelStreamUpdateEvent` with any other event or delta | dropped |
 | `beforeToolCallEvent` | `tool` with status `started` |
 | `afterToolCallEvent` | `tool` with status `succeeded` or `failed` |
 | `agentResultEvent` | `final`, built by `toFinalEvent()` |
 | Any other event | dropped |
 
-The final event reads only the text blocks of the last message, which is the answer the
-agent keeps in `agent.messages`. Text the model streamed before calling a tool,
-such as "Let me check the weather", is not part of it. A cancelled run gets `text: ''`,
-because the SDK fills its last message with a placeholder.
+Create one mapper per run with `createEventMapper()`. It numbers the run's tool calls
+itself: a provider's `toolUseId` is not guaranteed to be unique within a run, and a
+retried call repeats it.
+
+The final event reads the text and the cited text of the last message, which is the
+answer the agent keeps in `agent.messages`. Text the model streamed before calling a
+tool, such as "Let me check the weather", is not part of it. A cancelled run gets
+`text: ''`, because the SDK fills its last message with a placeholder.
+
+:::caution
+Text events reach the browser as the model generates them, before an output guardrail
+assesses the whole response. When the guardrail blocks it, the `redact` event and the
+final event replace the text on screen, but the user may already have read it. If
+blocked output must never reach the browser, don't publish `text` events for those runs,
+and show the answer from the final event only.
+:::
 
 ## Keeping a run alive across reconnects
 
@@ -176,8 +206,10 @@ last ID it saw, receives everything newer from the buffer, and then gets live ev
 The registry also decides what happens when the connection breaks:
 
 - A dropped connection only unsubscribes. After 30 seconds with no subscriber, the run
-  cancels its agent through `cancelSignal`, which stops token spend, and records a final
-  event with status `cancelled`.
+  requests cancellation through `cancelSignal`, and it ends with a final event with status
+  `cancelled`. Cancellation is cooperative: the agent stops at its next check, and a
+  running tool stops early only if it observes `context.cancelSignal`. See
+  [Cancellation](../agents/agent-loop.md#cancellation) for where the agent checks.
 - `execute()` pushes the final event once, after the loop: from the agent result, or
   `errorFinalEvent` when the stream throws. Error details stay in the server log, because
   a model provider error can include account IDs and resource names.
@@ -240,23 +272,26 @@ The events route follows the SSE format, plus a few rules that keep streams heal
 - A `: ping` comment every 15 seconds keeps proxies from closing an idle connection.
 - `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` stop caches and
   NGINX from buffering the stream.
+- A client that stops reading is dropped once 256 KiB of events wait for it, so a slow
+  connection can't pile up memory. `EventSource` reconnects with `Last-Event-ID`, and the
+  buffer replays what it missed.
 - The server ends the response after the final event. If the browser reconnects anyway, a
   204 response tells `EventSource` to stop.
 
 Check the stream from a terminal before you build the UI:
 
 ```bash
-curl -X POST localhost:3000/runs -H 'Content-Type: application/json' \
-  -d '{"prompt": "Tell me about agents in one sentence."}'
-# Example output:
-# {"id":"3f2c9a1e-5b7d-4c1e-9a0f-2d6b8e4c7a15"}
+RUN_ID=$(curl -s -X POST localhost:3000/runs -H 'Content-Type: application/json' \
+  -d '{"prompt": "Tell me about agents in one sentence."}' \
+  | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).id')
 
-curl -N localhost:3000/runs/<id>/events
-curl -N -H 'Last-Event-ID: 5' localhost:3000/runs/<id>/events
+curl -N "localhost:3000/runs/${RUN_ID}/events"
+curl -N -H 'Last-Event-ID: 5' "localhost:3000/runs/${RUN_ID}/events"
 ```
 
-The second stream replays the run from event 6. In Next.js, the paths are `/api/runs` and
-`/api/runs/events?id=<id>`.
+The first command keeps the run ID in `RUN_ID`. The last one replays the run from event 6.
+In Next.js, the paths are `/api/runs` and `/api/runs/events?id=${RUN_ID}`, quoted the same
+way.
 
 ## Reading the stream in the browser
 
@@ -273,6 +308,8 @@ A few details keep the client correct and accessible:
 
 - Close the `EventSource` when the final event arrives. Otherwise it reconnects once and
   stops at the 204 response.
+- Track tool calls by `callId`. Tools run concurrently by default, so several calls can
+  run at once, including two calls to the same tool.
 - Write the model response with `textContent`, not `innerHTML`, because the model response
   is untrusted input. If you render Markdown, sanitize the resulting HTML.
 - Make the status element an `aria-live="polite"` region, so screen readers announce tool
@@ -283,10 +320,8 @@ A few details keep the client correct and accessible:
 
 ## Running the complete example
 
-Put the four files in one project, start the server, and open the page in a browser.
-
-<Tabs>
-<Tab label="Express">
+Put the four files in one Express project, start the server, and open the page in a
+browser.
 
 Create the project and install the dependencies:
 
@@ -331,6 +366,7 @@ plain JavaScript, so the page works without a build step:
         const { id } = await response.json()
 
         let text = ''
+        const runningTools = new Map()
         answer.textContent = ''
         const source = new EventSource(`/runs/${id}/events`)
         source.onmessage = (message) => {
@@ -339,8 +375,14 @@ plain JavaScript, so the page works without a build step:
           if (event.type === 'text') {
             text += event.text
             answer.textContent = text
+          } else if (event.type === 'redact') {
+            text = event.text
+            answer.textContent = text
           } else if (event.type === 'tool') {
-            status.textContent = event.status === 'started' ? `Running ${event.name}` : ''
+            if (event.status === 'started') runningTools.set(event.callId, event.name)
+            else runningTools.delete(event.callId)
+            const names = [...runningTools.values()].join(', ')
+            status.textContent = names ? `Running ${names}` : ''
           } else if (event.type === 'final') {
             source.close()
             answer.textContent = event.text || `The run ended: ${event.status}.`
@@ -358,48 +400,44 @@ Start the server, then open `http://localhost:3000`:
 ```bash
 npx tsx server.ts
 ```
-</Tab>
-<Tab label="Next.js">
-
-Put `public-events.ts` and `agent-runs.ts` in `lib/`, and add the two route handlers from
-the SSE section. Call `streamAnswer()` from a client component, with its URLs changed to
-`/api/runs` and `/api/runs/events?id=${id}`. Then start the app:
-
-```bash
-npm install @strands-agents/sdk
-npm run dev
-```
-</Tab>
-</Tabs>
 
 Ask a question. The answer streams into the page, and the status line names each tool
 while it runs. When the run ends, the final event replaces the streamed text. To test a
 reconnect, take the run ID from the browser's network panel and use the `curl` commands
 from the SSE section.
 
+To run the example in Next.js, adapt it in an App Router project with
+`@strands-agents/sdk` installed. Put `public-events.ts` and `agent-runs.ts` in `lib/`, and
+use the two route handlers from
+[Streaming a run with server-sent events](#streaming-a-run-with-server-sent-events) in
+place of `server.ts`. Render the page from a client component that runs the logic of
+`streamAnswer()`, with its URLs changed to `/api/runs` and `/api/runs/events?id=${id}`.
+
 ## Switching to a WebSocket for two-way messages
 
-Switch to a WebSocket when the browser has to send messages while a run is in progress,
-such as an answer to an [interrupt](../interrupts.md). For one-way streaming, SSE does the
-same job with less code.
+Switch to a WebSocket when the browser sends the server messages during a run, or when
+your app already keeps a socket open. For one-way streaming, SSE does the same job with
+less code.
 
-Keep the same event schema and the same run registry. A WebSocket has no built-in resume,
-so the client sends the last ID it saw. Three client messages cover a run:
+Keep the same event schema and the same run registry. A WebSocket has no built-in
+reconnect, so after a drop the client opens a new socket and sends the last ID it saw.
+Three client messages cover a run:
 
 ```json
 { "type": "start", "prompt": "What is the weather in Lisbon?" }
-{ "type": "resume", "runId": "3f2c9a1e", "after": 41 }
+{ "type": "reconnect", "runId": "3f2c9a1e", "after": 41 }
 { "type": "cancel", "runId": "3f2c9a1e" }
 ```
 
-The server answers `start` and `resume` with the run's events, tagged with the run ID:
+The server answers `start` and `reconnect` with the run's events, tagged with the run ID:
 
 ```json
 { "runId": "3f2c9a1e", "id": 42, "v": 1, "type": "text", "text": "sunny" }
 ```
 
 On the server, handle both messages with `run.subscribe(after, send)` from
-`agent-runs.ts`, where `send` writes each event to the socket. Node.js has no built-in
+`agent-runs.ts`, where `send` writes each event to the socket. Apply the same limit as the
+SSE routes: close a socket whose `bufferedAmount` grows past it. Node.js has no built-in
 WebSocket server, so add a library such as `ws`. Next.js route handlers have no stable
 support for WebSocket upgrades, so run the WebSocket endpoint on a separate Node.js
 server, such as the Express app.
@@ -451,8 +489,6 @@ Continue with these pages:
 - [Stream event types](./events.md): every event the Strands stream emits, including the
   ones this schema drops.
 - [Async Iterators](./async-iterators.md): consume the stream directly in server code.
-- [Interrupts](../interrupts.md): pause a run for human input, the main reason to switch
-  to a WebSocket.
 - [Session management](../agents/session-management.md): keep a conversation across runs.
 - [Deploy to production](../deploy/index.md): deployment options for the server.
 

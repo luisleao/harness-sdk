@@ -3,13 +3,13 @@
 // files the page tells readers to create, so they do not resolve here.
 
 // --8<-- [start:event_mapper_imports]
-import type { AgentResult, AgentStreamEvent } from '@strands-agents/sdk'
+import type { AgentResult, AgentStreamEvent, ModelStreamEvent } from '@strands-agents/sdk'
 // --8<-- [end:event_mapper_imports]
 
 // --8<-- [start:agent_runs_imports]
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@strands-agents/sdk'
-import { errorFinalEvent, toFinalEvent, toPublicEvent } from './public-events'
+import { createEventMapper, errorFinalEvent, toFinalEvent } from './public-events'
 import type { PublicEnvelope, PublicEvent } from './public-events'
 // --8<-- [end:agent_runs_imports]
 
